@@ -1,0 +1,488 @@
+
+---
+title: "Spatial CellChat inference and analysis of cell-cell communication at cellular resolution from spatial transcriptomics"
+author: "Xiangzheng Cheng & Suoqin Jin"
+# date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+# toc: true
+    theme: united
+mainfont: Arial
+vignette: >
+  %\VignetteIndexEntry{Spatial CellChat inference and analysis of cell-cell communication at cellular resolution from spatial transcriptomics}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  progress = FALSE,
+  collapse = TRUE,
+  comment = "#>",
+  root.dir = './'
+)
+#knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+This vignette outlines the steps of inference, analysis and visualization of cell-cell communication at single-cell resolution for **a single spatial transcriptomics dataset using Spatial CellChat**. We showcase Spatial CellChat’s application to spatial transcriptomics data by applying it to a 10X Visium data on cells from human psoriatic skin (https://www.nature.com/articles/s41467-023-39020-4). Biological annotations of spots (i.e., cell group information) are obtained from the original study.
+
+Spatial CellChat requires gene expression and spatial location data of spots/cells as the user input and models the probability of cell-cell communication by integrating gene expression with spatial distance as well as prior knowledge of the interactions between signaling ligands, receptors and their cofactors. 
+
+Upon infering the intercellular communication network, Spatial CellChat's various functionality can be used for further data exploration, analysis, and visualization. 
+
+
+## Load the required libraries
+```{r, message=FALSE, warning=FALSE}
+library(SpatialCellChat)
+library(Matrix)
+library(patchwork)
+options(stringsAsFactors = F)
+
+# use `SetEnvironment` to do parallel computation and get Python back-end
+setEnvironment(workers = 2,future.globals.maxSize = 100000*1024^2, conda_env = NULL)
+# setEnvironment(2,future.globals.maxSize = 100000*1024^2,conda_env = "/home/xzcheng/miniconda3/envs/Chat")
+```
+
+# Part I: Data input & processing and initialization of Spatial CellChat object
+
+When inferring spatially resolved cell-cell communication from spatial transcriptomic data, user also should provide spatial coordinates/locations of spot/cell centroids. In addition, to filter out cell-cell communication beyond the maximum diffusion range of molecules (e.g., ~250μm), Spatial CellChat needs to compute the cell centroid-to-centroid distance in the unit of micrometers. Therefore, for spatial technologies that only provide spatial coordinates in pixels, CellChat converts spatial coordinates from pixels to micrometers by requiring users to input the conversion factor. 
+
+Spatial CellChat requires four user inputs: 
+
+* **`data.input` (Gene expression data of spots/cells)**: genes should be in rows with rownames and cells in columns with colnames. Normalized data (e.g., library-size normalization and then log-transformed with a pseudocount of 1) is required as input for Spatial CellChat analysis. If user provides count data, we provide a `normalizeData` function to account for library size and then do log-transformed.
+
+* **`meta` (User assigned cell labels and samples labels)**: a data frame (rows are cells with rownames) consisting of cell information, which will be used for defining cell groups. When performing spatial transcriptomics analysis with multiple samples/replicates, a column named `samples` should be provided. Of note, for comparison analysis across different conditions, users still need to create a CellChat object seperately for each condition.
+
+* **`coordinates` (Spatial coordinates of spots/cells)**: a data frame in which each row gives the spatial coordinates/locations of each cell/spot centroid. 
+
+* **`spatial.factors` (Spatial factors of spatial distance)**: a data frame containing two distance factors `ratio` and `tol`, which is dependent on spatial transcriptomics technologies (and specific datasets). (i) `ratio`: the conversion factor when converting spatial coordinates from Pixels or other units to Micrometers (i.e.,Microns). For example, setting `ratio = 0.18` indicates that 1 pixel equals 0.18um in the coordinates. (ii) `tol`: the tolerance factor to increase the robustness when comparing the center-to-center distance against the `interaction.range`. This can be the half value of cell/spot size in the unit of um. **Please check the [vignette of FAQ on applying CellChat to spatially resolved transcriptomics data](https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/FAQ_on_applying_CellChat_to_spatial_transcriptomics_data.html) for detailed explanations and setting of different technologies of spatial transcriptomics data.**
+
+
+When inferring contact-dependent or juxtacrine signaling by setting `contact.dependent = TRUE` in `computeCommunProb`, and using L-R pairs from `Cell-Cell Contact` signaling classified in `CellChatDB$interaction$annotation`, CellChat requires another one user input: 
+
+* **`contact.range`**: a value giving the interaction range (Unit: microns) to restrict the contact-dependent signaling. For spatial transcriptomics in a single-cell resolution, `contact.range` is approximately equal to the estimated cell diameter (i.e., the cell center-to-center distance), which means that contact-dependent or juxtacrine signaling can only happens when the two cells are contact to each other. Typically, `contact.range = 10`, which is a typical human cell size. 
+
+## Load data
+```{r, fig.width=6, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+# Here we load a Seurat object of 10X Visium human psoriatic skin data and its associated cell meta data
+# load("/Users/suoqinjin/Library/CloudStorage/OneDrive-Personal/works/SpatialCellChat/tutorial/visium_human_psoriasis.RData")
+load("./tutorial/visium_human_psoriasis.RData")
+Seurat::DefaultAssay(seu) <- "Spatial"
+seu@assays$Spatial@counts <- seu@assays$Spatial@data
+seu <- Seurat::NormalizeData(seu)
+
+## Prepare input data for Spatial CelChat analysis
+# get the deconvoluted cell type decomposition for this 10X Visium data
+cell.type.decomposition <- t(seu@assays[["predictions"]]@data)
+cell.type.decomposition[cell.type.decomposition<0.1] <- 0
+which(round(rowSums(cell.type.decomposition))!=1.)
+
+# prepare spatial transcriptomics information
+spatial.locs <- Seurat::GetTissueCoordinates(seu, scale = NULL, cols = c("imagerow", "imagecol"))
+# adjust the view
+spatial.locs[,2] <- max(spatial.locs[,2])-spatial.locs[,2]
+temp_coordinates <- spatial.locs
+spatial.locs[,1] <- temp_coordinates[,2]
+spatial.locs[,2] <- temp_coordinates[,1]
+spatial.locs[,1] <- max(spatial.locs[,1])-spatial.locs[,1]
+colnames(spatial.locs) <- c("x", "y")
+
+# spatial factors of spatial coordinates
+# For 10X Visium, the conversion factor of converting spatial coordinates from Pixels to Micrometers can be computed as the ratio of the theoretical spot size (i.e., 65um) over the number of pixels that span the diameter of a theoretical spot size in the full-resolution image (i.e., 'spot_diameter_fullres' in pixels in the 'scalefactors_json.json' file).
+# Of note, the 'spot_diameter_fullres' factor is different from the `spot` in Seurat object and thus users still need to get the value from the original json file.
+scalefactors <- jsonlite::fromJSON(txt = file.path("./tutorial/spatial_imaging_data_visium_psoriasisSkin/scalefactors_json.json"))
+spot.size <- 65 # the theoretical spot size (um) in 10X Visium
+conversion.factor <- spot.size/scalefactors$spot_diameter_fullres
+spatial.factors <- list(ratio = conversion.factor, tol = spot.size/2)
+```
+
+## Create a Spatial CellChat object
+**USERS can create a new Spatial CellChat object from a data matrix or Seurat.** If input is a Seurat object, the meta data in the object will be used by default and USER must provide `group.by` to define the cell groups. e.g, group.by = "ident" for the default cell identities in Seurat object. 
+
+```{r, fig.width=6, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+chat <- createSpatialCellChat(
+  object = seu, # Seurat
+  group.by = "final.clusters",
+  assay = "Spatial", # normalized
+  datatype = "spatial",
+  coordinates = spatial.locs,
+  spatial.factors = spatial.factors
+)
+chat
+
+# check distance
+# spatialCCCDistPlot(chat)
+```
+
+## Set the ligand-receptor interaction database
+Before users employ Spatial CellChat to infer cell-cell communication, they need to set the ligand-receptor interaction database and identify over-expressed ligands or receptors.
+
+Our database CellChatDB is a manually curated database of literature-supported ligand-receptor interactions in both human and mouse. CellChatDB v2 contains ~3,200 validated molecular interactions, including ~40% of secrete autocrine/paracrine signaling interactions, ~17% of cell-cell contact interactions, ~13% of extracellular matrix (ECM)-receptor interactions and ~30% non-protein signaling. Compared to CellChatDB v1, CellChatDB v2 adds more than 1000 protein and non-protein interactions such as metabolic and synaptic signaling.
+
+CellChatDB v2 also adds additional functional annotations of ligand-receptor pairs, such as UniProtKB keywords (including biological process, molecular function, functional class, disease, etc), subcellular location and relevance to neurotransmitter.
+
+Users can update CellChatDB by adding their own curated ligand-receptor pairs. Please check the [tutorial on updating the ligand-receptor interaction database CellChatDB](https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/Update-CellChatDB.html). 
+
+When analyzing human samples, use the database **`CellChatDB.human`**; when analyzing mouse samples, use the database **`CellChatDB.mouse`**. CellChatDB categorizes ligand-receptor pairs into different types, including “Secreted Signaling”, “ECM-Receptor”, “Cell-Cell Contact” and “Non-protein Signaling”. By default, the “Non-protein Signaling” are not used. 
+
+```{r, fig.width=6,fig.height = 2.5, fig.wide = TRUE, fig.align = "center"}
+CellChatDB <- CellChatDB.human # use CellChatDB.mouse if running on mouse data
+# showDatabaseCategory(CellChatDB)
+# Show the structure of the database
+dplyr::glimpse(CellChatDB$interaction)
+
+# use a subset of CellChatDB for cell-cell communication analysis
+CellChatDB.use <- subsetDB(CellChatDB, search = c("Secreted Signaling", "ECM-Receptor", "Cell-Cell Contact"), non_protein = F)
+
+# Only uses the Secreted Signaling from CellChatDB v1
+# CellChatDB.use <- subsetDB(CellChatDB, search = list(c("Secreted Signaling"), c("CellChatDB v1")), key = c("annotation", "version"))
+
+# use all CellChatDB except for "Non-protein Signaling" for cell-cell communication analysis
+# CellChatDB.use <- subsetDB(CellChatDB)
+
+# use all CellChatDB for cell-cell communication analysis
+# CellChatDB.use <- CellChatDB # simply use the default CellChatDB. We do not suggest to use it in this way because CellChatDB v2 includes "Non-protein Signaling" (i.e., metabolic and synaptic signaling) that can be only estimated from gene expression data.
+
+# set the used database in the object
+chat@DB <- CellChatDB.use
+```
+
+## Preprocessing the expression data for cell-cell communication analysis
+To infer spatially variable communications, Spatial CellChat identifies spatially variable ligands or receptors and then identifies spatially variable ligand-receptor interactions if either ligand or receptor are spatially variable. 
+
+```{r, eval=TRUE}
+# subset the expression data of signaling genes for saving computation cost
+chat <- subsetData(chat) # This step is necessary even if using the whole database
+chat <- preProcessing(chat) 
+chat <- identifyOverExpressedGenes(
+  chat,
+  selection.method = "meringue", # method for selecting (spatially) variable features
+  do.grid = F # if true, do "grid" operation to speed up computation
+)
+chat <- identifyOverExpressedInteractions(
+  chat,
+  variable.both = F # only require that either ligand or receptor from one pair is over-expressed
+)
+```
+
+# Part II: Inference of cell-cell communication network
+Spatial CellChat infers the biologically significant cell-cell communication by assigning each interaction with a probability value and performing a permutation test. Spatial CellChat models the probability of cell-cell communication by integrating gene expression with prior known knowledge of the interactions between signaling ligands, receptors and their cofactors using the law of mass action, while also taking into account the spatial distance between cells or spots.
+
+## Compute the communication probability and infer cellular communication network at the individual cell level
+Users may need to adjust the parameter `scale.distance` when working on data from other spatial transcriptomics technologies. Please check the documentation in detail via `?computeCommunProb`.
+
+When inferring contact-dependent or juxtacrine signaling, users should provide a value of `contact.range` and set `contact.dependent = TRUE`. By default, `contact.range = 10`, which is a typical human cell size.
+
+```{r}
+chat <- computeCommunProb(
+  chat,
+  distance.use = TRUE, scale.distance = 0.2,
+  contact.dependent = TRUE,
+  interaction.range = 250, contact.range = 10
+)
+```
+
+Users can filter out statistically non-significant communications as well as communications mediated by ligand–receptor pairs with only few interactions.
+
+```{r}
+chat <- filterProbability(chat)
+chat <- filterCommunication(
+  chat, min.cells = NULL,
+  min.links = 10,
+  min.cells.sr = 10
+)
+
+# # checkpoint (optional)
+# readr::write_rds(chat,file = "./results/chat_computeCommunProb.rds")
+# chat <- readr::read_rds(file = "./results/chat_computeCommunProb.rds")
+```
+
+## Infer the communication network at the cell group level
+For low-resolution spatial data, such as the dataset used in this example, use
+`computeAvgCommunProb_Visium` to compute group-level cell–cell communication and pass the cell type proportions (if available) through parameter `cell.type.decomposition`. For high-resolution data, please use `computeAvgCommunProb` instead.
+
+To quickly examine the inference results, USER can set `nboot = 20` in `computeAvgCommunProb`.
+
+
+```{r}
+chat <- computeAvgCommunProb_Visium(
+  chat,
+  cell.type.decomposition = as.matrix(cell.type.decomposition),
+  avg.type = 'avg',
+  nboot = 100,
+  do.permutation = T
+)
+```
+Users can filter out the cell group-level communication if there are only few cells in certain cell groups. By default, the minimum number of cells required in each cell group for cell-cell communication is 10. 
+
+```{r}
+chat <- filterCommunication(chat, min.cells = 10, min.links = NULL, min.cells.sr = NULL)
+
+# # checkpoint (optional)
+# readr::write_rds(chat,file = "./results/Chat_computeAvgCommunProb.rds")
+# chat <- readr::read_rds(file = "./results/Chat_computeAvgCommunProb.rds")
+```
+
+## Extract the inferred cellular communication network as a data frame
+We provide a function `subsetCommunication` to easily access the inferred cell-cell communications of interest. For example, 
+
+* ```df.net <- subsetCommunication(chat)``` returns a data frame consisting of all the inferred cell-cell communications at the level of ligands/receptors. Set `slot.name = "netP"` to access the the inferred communications at the level of signaling pathways
+
+* ```df.net <- subsetCommunication(chat, sources.use = c(1,2), targets.use = c(4,5))``` gives the inferred cell-cell communications sending from cell groups 1 and 2 to cell groups 4 and 5. 
+
+* ```df.net <- subsetCommunication(chat, signaling = c("WNT", "TGFb"))``` gives the inferred cell-cell communications mediated by signaling WNT and TGFb. 
+
+```{r}
+df.net <- subsetCommunication(chat)
+head(df.net)
+```
+
+## Infer the cell-cell communication at a signaling pathway level
+CellChat computes the communication probability on signaling pathway level by summarizing the communication probabilities of all ligands-receptors interactions associated with each signaling pathway.  
+
+NB: The inferred intercellular communication network of each ligand-receptor pair and each signaling pathway is stored in the slot 'net' and 'netP', respectively.
+
+```{r}
+chat <- computeCommunProbPathway(chat)
+```
+
+## Calculate the aggregated cell-cell communication network 
+We can calculate the aggregated cell-cell communication network by counting the number of links or summarizing the communication probability. USER can also calculate the aggregated network among a subset of cell groups by setting `sources.use` and `targets.use`. 
+
+```{r}
+chat <- aggregateNet(chat)
+
+# # checkpoint (optional)
+# readr::write_rds(chat,file = "./results/Chat_computeCommunProbPathway.rds")
+# chat <- readr::read_rds(file = "./results/Chat_computeCommunProbPathway.rds")
+```
+
+## Compute the network centrality scores
+
+Users can run `netAnalysis_computeCentrality` with `degree.only = T` to speed up computation when only "outdeg_unweighted", "indeg_unweighted","outdeg" and "indeg" are needed to do analysis.
+
+```{r}
+chat <- netAnalysis_computeCentrality(
+  chat,
+  slot.name = "net",
+  do.group = F,
+  degree.only = T
+)
+chat <- netAnalysis_computeCentrality(
+  chat,
+  slot.name = "net",
+  do.group = T,
+  degree.only = T
+)
+chat <- netAnalysis_computeCentrality(
+  chat,
+  slot.name = "netP",
+  do.group = F,
+  degree.only = T
+)
+chat <- netAnalysis_computeCentrality(
+  chat,
+  slot.name = "netP",
+  do.group = T,
+  degree.only = T
+)
+
+# # checkpoint (optional)
+# readr::write_rds(chat,file = "./results/Chat_computeCentrality.rds")
+# chat <- readr::read_rds(file = "./results/Chat_computeCentrality.rds")
+```
+
+# Part III: Downstream analysis of cell-cell communication network
+Upon infering the cell-cell communication network, Spatial CellChat provides various functionality for further data exploration, analysis, and visualization.
+
+## Spatial plot
+```{r, fig.width=6, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+# show the cell type proportion of each spot
+spatialDimPlot(chat, proportion = cell.type.decomposition, point.size = 1.5)
+```
+
+## Spatial feature plot
+We provide the function `spatialFeaturePlot` to display gene expression distributions, including the expression patterns of genes associated with specific pathways or L-R pairs.
+
+Here we take input of one signaling pathway as an example. All the signaling pathways showing significant communications can be accessed by `chat@netP$pathways`.
+```{r, fig.width=10, fig.height = 6, fig.wide = TRUE, fig.align = "center"}
+pathway.show <- "TNF"
+# show the expression distributions of genes associated with the specific pathway
+spatialFeaturePlot(chat, signaling = pathway.show, do.group = FALSE, do.binary = FALSE, color.heatmap = "Spectral", point.size = 1.3)
+```
+
+The function `extractEnrichedLR` is used to extract all the significant interactions (L-R pairs) and related signaling genes for a given signaling pathway. Users can set `do.binary = TRUE` in `spatialFeaturePlot` to binarize and visualize the expression distribution of the ligand and receptor genes in a specific LR pair within the same plot. In this case, parameter `cutoff` must be provided as the threshold for expression levels.
+```{r, fig.width=6, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+# show the expression distributions of genes associated with the specific L-R pair
+enrichedLR <- extractEnrichedLR(chat, signaling = pathway.show, do.group = FALSE)
+LR.show <- enrichedLR[1,,drop = FALSE] # only show one ligand-receptor pair
+spatialFeaturePlot(chat, pairLR.use =  LR.show, do.group = FALSE, do.binary = TRUE, cutoff = 0.05, point.size = 1.5)
+
+```
+
+## Visualize inferred communication at the individual cell level
+### Show outgoing and incoming scores of pathways
+```{r, fig.width=8, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+gg1 <- spatialVisual_scoring(chat, signaling = pathway.show, slot.name = "netP", do.group = FALSE, measure = c("outdeg"), do.binary = FALSE, color.heatmap = "Blues", point.size = 1)
+gg2 <- spatialVisual_scoring(chat, signaling = pathway.show, slot.name = "netP", do.group = FALSE, measure = c("indeg"), do.binary = FALSE, color.heatmap = "Reds", point.size = 1)
+patchwork::wrap_plots(gg1, gg2, ncol =2)
+```
+
+Setting `merge = TRUE` allows the simultaneous display of outgoing and incoming scores, as well as their overlapping regions.
+```{r, fig.width=6, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+spatialVisual_scoring(chat, signaling = pathway.show, do.group = FALSE, merge = TRUE, do.binary = FALSE, point.size = 1)
+```
+
+### Show outgoing and incoming scores of L-R pairs
+Here we take input of one L-R pairs as an example. All the L-R pairs showing significant communications can be accessed by `chat@net$LR.sig`.
+```{r, fig.width=8, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+LR.show <- chat@net$LR.sig[1]
+gg1 <- spatialVisual_scoring(chat, signaling = LR.show, slot.name = "net", do.group = FALSE, measure = c("outdeg"), do.binary = FALSE, color.heatmap = "Blues", point.size = 1)
+gg2 <- spatialVisual_scoring(chat, signaling = LR.show, slot.name = "net", do.group = FALSE, measure = c("indeg"), do.binary = FALSE, color.heatmap = "Reds", point.size = 1)
+patchwork::wrap_plots(gg1, gg2, ncol =2)
+```
+
+## Visualize inferred communication at the cell group level
+### Visualize inferred network of signaling pathways between cell groups
+**Visualization of cell-cell communication at different levels**: One can visualize the inferred communication network of signaling pathways using `netVisual_aggregate`, and visualize the inferred communication networks of individual L-R pairs associated with that signaling pathway using `netVisual_individual`.
+
+We provide four different visualization methods: circle plot, hierarchy plot, chord diagram, and spatial plot. Users can select their preferred method through the `layout` parameter. Please check the [Full tutorial for CellChat analysis of a single dataset with detailed explanation of each function](https://htmlpreview.github.io/?https://github.com/jinworks/CellChat/blob/master/tutorial/CellChat-vignette.html#visualize-each-signaling-pathway-using-hierarchy-plot-circle-plot-or-chord-diagram) for detailed explanations. Here we only showcase the `circle plot`.
+```{r, fig.height = 5, fig.wide = TRUE, fig.align = "center"}
+netVisual_aggregate(chat, signaling = pathway.show, layout = "circle")
+```
+
+### Identify major senders and receivers from the defined cell groups
+Spatial CellChat used out-degree and in-degree in weighted-directed networks to respectively identify dominant senders and receivers for the intercellular communications.
+```{r, fig.width=5, fig.height = 3, fig.wide = TRUE, fig.align = "center"}
+library(ComplexHeatmap)
+library(RColorBrewer)
+
+netAnalysis_signalingRole_network(
+  chat, signaling = pathway.show, slot.name = "netP",
+  measure = c("outdeg","indeg"), measure.name = c("Sender","Receiver"),
+  width = 8, height = 3, font.size = 10
+)
+```
+
+### Visualize the inferred CCC using heatmap plot
+```{r, fig.width=5, fig.height = 4.5, fig.wide = TRUE, fig.align = "center"}
+netVisual_heatmap(chat, slot.name="netP", signaling = pathway.show, color.heatmap = "Reds")
+```
+
+## Hot spots analysis
+### Show the incoming and outgoing scores of secreted signaling and cell-cell contact
+```{r, fig.width=8, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+idx.Paracrine <- which(chat@LR$LRsig$annotation=="Secreted Signaling")
+idx.Juxtracrine <- which(chat@LR$LRsig$annotation=="Cell-Cell Contact")
+# incoming scores
+g1 <- spatialGiPlot(chat,return.object = F,plot.title = "Incoming hotspot scores of secreted signaling",slot.name = "net",signaling.name = idx.Paracrine,measure = c("indeg"),measure.name = c("incoming"),point.size = 1)
+g2 <- spatialGiPlot(chat,return.object = F,plot.title = "Incoming hotspot scores of cell-cell contact signaling",slot.name = "net",signaling.name = idx.Juxtracrine,measure = c("indeg"),measure.name = c("incoming"),point.size = 1)
+patchwork::wrap_plots(g1, g2, ncol = 2)
+
+```
+
+### Categorize cells based on the hot spots analysis of incoming scores
+```{r, fig.width=6, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+chat <- spatialGiPlot(chat,plot.title = "Secreted Signaling",slot.name = "net",signaling.name = idx.Paracrine,measure = c("indeg"),measure.name = c("incoming"),show.plot = FALSE)
+chat <- spatialGiPlot(chat,plot.title = "Cell-Cell Contact",slot.name = "net",signaling.name = idx.Juxtracrine,measure = c("indeg"),measure.name = c("incoming"),show.plot = FALSE)
+chat@meta <- chat@meta %>%
+  mutate(SecretedHotspot = Getis.Ord.Gi.Secreted.Signaling*(Getis.Ord.Gi.P.Secreted.Signaling<0.05)) %>%
+  mutate(SecretedHotspot = ifelse(SecretedHotspot > 0, "Hot", ifelse(SecretedHotspot < 0, "Cold", "Other")))
+spatialDimPlot(chat,group.by = "SecretedHotspot",point.size = 1.5, color.use = c("Cold"="#2171b5", "Hot"="#cb181d", "Other"="#E5E5E5"))
+
+```
+
+### Visualize the enriched cell groups
+```{r, fig.width=5, fig.height = 3, fig.wide = TRUE, fig.align = "center"}
+spatialLeePlot(chat,group.by2 = "SecretedHotspot",cutoff.Lee = 0.05, y.levels = c("Hot","Cold","Other"))
+```
+
+### Identify the enriched signaling
+We provide the function `rankNet` for ranking communication-active signaling. When analyzing signaling pathways, set `slot.name = 'netP'`; when analyzing ligand–receptor pairs, set `slot.name = 'net'`.
+
+In addition, users can specify the type of signaling using the `signaling.type` parameter, which defaults to `NULL` for the overall ranking. And the source and target cell groups can be defined using parameters `sources.use` and `targets.use`, respectively.
+```{r, fig.width=8, fig.height = 12, fig.wide = TRUE, fig.align = "center"}
+g1 <- rankNet(chat, mode = "single", slot.name = "netP", measure = "weight", signaling.type = "Secreted Signaling",title = "Secreted Signaling")
+g2 <- rankNet(chat, mode = "single", slot.name = "netP", measure = "weight", signaling.type = "ECM-Receptor",title = "ECM-Receptor")
+g3 <- rankNet(chat, mode = "single", slot.name = "netP", measure = "weight", signaling.type = "Cell-Cell Contact",title = "Cell-Cell Contact")
+patchwork::wrap_plots(g1, g2, g3, ncol = 3)
+```
+
+If there are too many signaling pathways, users can store the results as a data frame for further analysis.
+```{r}
+df1 <- with(g1$data, g1$data[order(-contribution),]); df1$type <- "Secreted Signaling"
+df2 <- with(g2$data, g2$data[order(-contribution),]); df2$type <- "ECM-Receptor"
+df3 <- with(g3$data, g3$data[order(-contribution),]); df3$type <- "Cell-Cell Contact"
+df <- rbind(df1,df2,df3)
+head(df)
+```
+
+The function `netAnalysis_contribution` is provided to rank the contribution of each L-R pair within a specified signaling pathway.
+```{r, fig.width=4, fig.height = 5, fig.wide = TRUE, fig.align = "center"}
+netAnalysis_contribution(chat, signaling = 'ncWNT')
+```
+
+## Spatial cooccurrence analysis
+We use the Lee statistic to infer the spatial co-occurrence between two features. Users can specify the type of distance weight matrix via the `lw.type` parameter in function `spatialLeePlot` and the distance weight matrix will then be computed automatically. Alternatively, a precomputed distance weight matrix can be provided directly through the `lw` parameter.
+```{r, fig.width=10, fig.height = 2, fig.wide = TRUE, fig.align = "center"}
+Genes <- extractEnrichedLR(chat, signaling = "CXCL", do.group = FALSE, geneLR.return = TRUE)$geneLR
+mat1 <- t(as.matrix(chat@data[Genes,]))
+
+indeg <- chat@net$centr.cell['indeg',,]
+LR.pairs <- extractEnrichedLR(chat, signaling = "IL17", do.group = FALSE)$interaction_name
+mat2 <- indeg[,LR.pairs]
+
+spatialLeePlot(chat, group.by2 = mat2, group.by1 = mat1, lw.type = "interaction.range")
+```
+
+## CCC topic analysis
+### CCC topic identification
+
+```{r, fig.width = 5, fig.height = 5, fig.wide = TRUE, fig.align = "center"}
+# choose the rank K first
+# chat <- identifyCellTopics(chat,slot.name = "net",pattern = "incoming", nmf.k = seq(8,20,4))
+# then perform cell topic analysis
+topic.k = 12
+chat <- identifyCellTopics(chat,slot.name = "net",pattern = "incoming",topic.k = topic.k, verbose=FALSE)
+```
+
+### Visualization of CCC topics
+The spatial distribution of each topic.
+```{r, fig.width = 10, fig.height = 5, fig.wide = TRUE, fig.align = "center"}
+spatialTopicPlot(
+  chat,
+  pattern = "incoming",
+  color.heatmap = "Reds",
+  show.legend = FALSE,
+  point.size = 1.3,
+  ncol = topic.k/2
+)
+```
+
+The cell type composition of each topic.
+```{r, fig.width=3, fig.height = 4, fig.wide = TRUE, fig.align = "center"}
+netVisual_TopicComposition(
+  chat,
+  x.group = NULL, # use cell type annotations
+  y.group = "topicIn",
+  cluster.rows = TRUE
+)
+```
+
+The ranking of enriched ligand-receptor pairs within cell topics. Note that only the top signaling pathways are showed with a text annotation.
+```{r, fig.width=10, fig.height = 6, fig.wide = TRUE, fig.align = "center"}
+netVisual_TopicSignaling(
+  chat,
+  pattern = "incoming",
+  ncol = topic.k/2
+)
+```
+# Save the Spatial CellChat object
+```{r, eval=FALSE}
+readr::write_rds(chat,file = "./results/chat_Downstream.rds")
+```
+
+
