@@ -190,55 +190,58 @@ computeCommunProb <- function (
   # index.antagonist <- which(!is.na(pairLRsig$antagonist) & pairLRsig$antagonist != "")
 
   # Compute the communication probability/strength between any interacting individual cells for each LR pair
-  Prob.cell_ <- my_future_lapply(
-    X = 1:nLR,
-    FUN = function(i) {
-
-      x_ <- as(matrix(dataLavg[i,],nrow = 1),"TsparseMatrix")
-      y_ <- as(matrix(dataRavg[i,],nrow = 1),"TsparseMatrix")
-      # dataLR <- Matrix::crossprod(matrix(dataLavg[i,],nrow = 1),
-      #                             matrix(dataRavg[i,],nrow = 1))
-      # dataLR <- as(dataLR, Class = "dgCMatrix");gc();
-      dataLR <- Matrix::crossprod(x_,y_)
-
-
-      # dataLR is a sparse Matrix => P1 will be a sparse Matrix too
-      P1 <- HillFunctionFordataLR(dataLR = dataLR, Kh = Kh, n = n)
-
-      # P1_Pspatial is a dgCMatrix
-      P1_Pspatial <- P1 * P.spatial;rm(P1);gc()
-
-      if (!use.AGAN) { # use.AGAN = F
-
-        # ####################################
-        # Codes below are necessary because we still need to take some contact-dependent signalings
-        # into consideration when `use.AGAN=F`
+   myElementwiseProduct_fast <- function(SparseMat, DenseVec) {
+    SparseMat@x <- SparseMat@x *
+      DenseVec[SparseMat@i + 1] *
+      DenseVec[rep(seq_len(ncol(SparseMat)) - 1, diff(SparseMat@p)) + 1]
+    
+    SparseMat
+  }
+  
+  # Compute the communication probability/strength between any interacting individual cells for each LR pair
+  sp <- summary(P.spatial) 
+  
+  template <- sparseMatrix(
+    i = sp$i,
+    j = sp$j,
+    x = numeric(length(sp$i)),
+    dims = dim(P.spatial)
+  )
+  options(future.stdout = FALSE)
+  
+  Prob.cell_ <- with_progress({
+    
+    p <- progressor(along = seq_len(nLR))
+    
+    future_lapply(
+      X = seq_len(nLR),
+      future.seed = TRUE,
+      
+      FUN = function(i) {
+        
+        # accès direct (rapide)
+        x_ <- dataLavg[i, ]
+        y_ <- dataRavg[i, ]
+        
+        # calcul vectorisé
+        dataLR <- x_[sp$i + 1] * y_[sp$j + 1]
+        dataLR <- dataLR^n / (Kh^n + dataLR^n)
+        
+        # sparse rapide via template
+        P1_Pspatial <- template
+        P1_Pspatial@x <- dataLR * sp$x
+        
+        # contact
         if (i > nLR1) {
-          P1_Pspatial <- P1_Pspatial * adj.contact
+          P1_Pspatial@x <- P1_Pspatial@x * adj.contact@x
         }
-        # ####################################
-
-        # Pnull.cell is a sparse matrix
-        Pnull.cell = P1_Pspatial
-        dimnames(Pnull.cell) <- list(NULL,NULL)
-        return(Pnull.cell)
-
-      } else { # use.AGAN = T
-
-        if (i > nLR1) {
-          P1_Pspatial <- P1_Pspatial * adj.contact
-        }
-
-        # if P1_Pspatial is all-zero matrix, iteration can be terminated in advance
-        if (sum(P1_Pspatial) == 0){
-          # For test: sum(P1_Pspatial) == 0
-          Pnull.cell = P1_Pspatial
-          dimnames(Pnull.cell) <- list(NULL,NULL)
-          return(Pnull.cell)
+        
+        # cas simple
+        if (!use.AGAN || all(P1_Pspatial@x == 0)) {
+          result <- P1_Pspatial
+          
         } else {
-
-          # For test: is.element(i, index.agonist)
-          # data.agonist => P2
+          
           data.agonist <- computeExpr_agonist(
             data.use = data.use,
             pairLRsig,
@@ -247,12 +250,9 @@ computeCommunProb <- function (
             Kh = Kh,
             n = n
           )
-
-          # P_ = P1*Pspatial*P2
-          P_ <- myElementwiseProduct(P1_Pspatial,data.agonist)
-
-
-          # data.antagonist => P3
+          
+          P_ <- myElementwiseProduct_fast(P1_Pspatial, data.agonist)
+          
           data.antagonist <- computeExpr_antagonist(
             data.use = data.use,
             pairLRsig,
@@ -261,18 +261,17 @@ computeCommunProb <- function (
             Kh = Kh,
             n = n
           )
-
-          # Note: Pnull.cell = P1*Pspatial*P2*P3
-          Pnull.cell <- myElementwiseProduct(P_,data.antagonist)
-          rm(P_)
-          # Pnull.cell is "dgCMatrix"
-          dimnames(Pnull.cell) <- list(NULL,NULL)
-          return(Pnull.cell)
+          
+          result <- myElementwiseProduct_fast(P_, data.antagonist)
         }
+        
+        # update progression
+        p(sprintf("i=%d", i))
+        
+        result
       }
-    },
-    simplify = F # return a list
-  )
+    )
+  })
 
   # bind the Prob.cell `list` => a `sparse3Darray`
   # then the Prob.cell's shape will be (nC,nC,nLR)
