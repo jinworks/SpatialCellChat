@@ -6,3 +6,5 @@ Spatial CellChat (i.e., CellChat v3) is an updated version of CellChat toolkit t
 To ensure efficient and scalable inference of cell-cell communication at single-cell resolution from spatial transcriptomics data, Spatial CellChat optimizes the data structure within CellChat object. To enable users still can run their previously calculated CellChat v1/v2 object and smoothly upgrade to CellChat v3, we currently deposite the source codes and tutorials of Spatial CellChat at this GitHub repository. 
 
 The instructions of installation and tutorials are available at [CellChat toolkit](https://github.com/jinworks/CellChat).
+
+The Python implementation of Spatial CellChat is available at [SpatialCellChat-python](https://github.com/Bio-Babel/SpatialCellChat-python) and as a part of [Bio-Babel](https://biobabel.stanford.edu/) from [Qiu Lab @Stanford](https://www.devo-evo.com/).
